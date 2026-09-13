@@ -1,99 +1,111 @@
 const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    DisconnectReason,
-    fetchLatestBaileysVersion,
-    Browsers
-} = require('@whiskeysockets/baileys');
-const pino = require('pino');
-const { Boom } = require('@hapi/boom');
-const readline = require('readline');
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+} = require("@whiskeysockets/baileys");
+const pino = require("pino");
+const express = require("express");
+const config = require("./config");
+const { loadCommands, handleCommand } = require("./commands");
 
-// Configuration
-const BOT_NAME = 'Leeskies MD';
-const SESSION_DIR = './session';
-const USE_PAIRING_CODE = false; // Set to true if you want an 8-digit code instead of scanning QR
-const PHONE_NUMBER = '234XXXXXXXXXX'; // Your number (with country code, no '+') if USE_PAIRING_CODE is true
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
+let currentPairingCode = "Generating code, please refresh in a few seconds...";
+
+// Serve pairing code over HTTP for web browsers
+app.get("/", (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>${config.botName} - Pairing</title>
+        <style>
+          body { font-family: sans-serif; background: #0f172a; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+          .card { background: #1e293b; padding: 2rem; border-radius: 12px; text-align: center; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+          .code { font-size: 2rem; font-weight: bold; color: #22c55e; letter-spacing: 4px; margin: 1.5rem 0; background: #0f172a; padding: 1rem; border-radius: 8px; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h2>${config.botName} Pairing Code</h2>
+          <div class="code">${currentPairingCode}</div>
+          <p>Enter this code in <b>WhatsApp > Linked Devices > Link with phone number instead</b>.</p>
+        </div>
+      </body>
+    </html>
+  `);
 });
-const question = (text) => new Promise((resolve) => rl.question(text, resolve));
+
+app.listen(PORT, () => {
+  console.log(`[${config.botName}] Web server running on port ${PORT}`);
+});
 
 async function startLeeskiesMD() {
-    // 1. Load session credentials from local storage
-    const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-    const { version, isLatest } = await fetchLatestBaileysVersion();
+  const { state, saveCreds } = await useMultiFileAuthState("./session");
 
-    console.log(`\n================================`);
-    console.log(`⚡ Initializing ${BOT_NAME}...`);
-    console.log(`📦 Baileys Version: v${version.join('.')} (Latest: ${isLatest})`);
-    console.log(`================================\n`);
+  // Load plugins dynamically
+  loadCommands();
 
-    // 2. Initialize the WhatsApp Socket
-    const sock = makeWASocket({
-        version,
-        logger: pino({ level: 'silent' }), // Suppress verbose engine logs
-        printQRInTerminal: !USE_PAIRING_CODE,
-        auth: state,
-        browser: Browsers.macOS('Desktop'), // Prevents suspicious login flags
-        generateHighQualityLinkPreview: true,
-        syncFullHistory: false
-    });
+  const sock = makeWASocket({
+    logger: pino({ level: "silent" }),
+    printQRInTerminal: false, // Prevents Baileys deprecation warning
+    auth: state,
+    browser: ["Ubuntu", "Chrome", "20.0.04"],
+  });
 
-    // 3. Pairing Code Logic (if enabled & not registered yet)
-    if (USE_PAIRING_CODE && !sock.authState.creds.registered) {
-        let phoneNumber = PHONE_NUMBER;
-        if (!phoneNumber || phoneNumber.includes('X')) {
-            phoneNumber = await question('📱 Enter your WhatsApp phone number (with country code): ');
-        }
-        phoneNumber = phoneNumber.replace(/[^0-9]/g, '');
+  sock.ev.on("creds.update", saveCreds);
 
-        setTimeout(async () => {
-            const code = await sock.requestPairingCode(phoneNumber);
-            console.log(`\n🔑 Your Pairing Code for ${BOT_NAME}: [ ${code} ]\n`);
-        }, 3000);
+  // Automatic Pairing Code Request for non-registered sessions
+  if (!sock.authState.creds.registered) {
+    const phoneNumber = config.ownerNumber.replace(/[^0-9]/g, "");
+
+    setTimeout(async () => {
+      try {
+        const rawCode = await sock.requestPairingCode(phoneNumber);
+        currentPairingCode = rawCode?.match(/.{1,4}/g)?.join("-") || rawCode;
+
+        console.log(`\n=================================`);
+        console.log(`🤖 BOT NAME: ${config.botName}`);
+        console.log(`📱 PHONE NUMBER: ${phoneNumber}`);
+        console.log(`🔑 PAIRING CODE: \x1b[32m${currentPairingCode}\x1b[0m`);
+        console.log(`=================================\n`);
+      } catch (err) {
+        console.error("❌ Failed to generate pairing code:", err.message);
+        currentPairingCode = "Error generating code. Check console logs.";
+      }
+    }, 4000);
+  }
+
+  // Handle incoming commands
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify") return;
+    await handleCommand(sock, messages[0]);
+  });
+
+  // Handle connection updates
+  sock.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect } = update;
+
+    if (connection === "connecting") {
+      console.log(`[${config.botName}] Connecting to WhatsApp...`);
+    } else if (connection === "open") {
+      console.log(`✅ [${config.botName}] Connected successfully!`);
+      currentPairingCode = "Device already paired and active! ✅";
+    } else if (connection === "close") {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+      console.log(`[${config.botName}] Connection closed (Reason Code: ${statusCode})`);
+
+      if (shouldReconnect) {
+        console.log(`[${config.botName}] Reconnecting...`);
+        startLeeskiesMD();
+      } else {
+        console.log(`[${config.botName}] Session logged out. Delete ./session directory and restart.`);
+      }
     }
-
-    // 4. Save session updates whenever credentials change
-    sock.ev.on('creds.update', saveCreds);
-
-    // 5. Connection lifecycle management
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-
-        if (connection === 'close') {
-            const shouldReconnect =
-                (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-
-            console.log(`[!] Connection closed. Reason:`, lastDisconnect?.error?.message || 'Unknown');
-
-            if (shouldReconnect) {
-                console.log(`🔄 Reconnecting ${BOT_NAME}...`);
-                startLeeskiesMD();
-            } else {
-                console.log(`❌ Logged out. Delete the '${SESSION_DIR}' folder and scan again.`);
-                process.exit(0);
-            }
-        } else if (connection === 'open') {
-            console.log(`\n========================================`);
-            console.log(`✅ ${BOT_NAME} IS SUCCESSFULLY CONNECTED!`);
-            console.log(`🤖 Logged in as: ${sock.user.id.split(':')[0]}`);
-            console.log(`========================================\n`);
-        }
-    });
-
-    // 6. Message Event Hook (ready for your command router)
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify') return;
-        const msg = messages[0];
-        if (!msg.message || msg.key.fromMe) return;
-
-        // Command handler/router goes here
-    });
-
-    return sock;
+  });
 }
 
 startLeeskiesMD();
