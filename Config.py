@@ -1,4 +1,4 @@
-# config.js
+# config.j
 
 BOT_NAME = "Leeskies MD"
 BOT_VERSION = "1.0.0"
